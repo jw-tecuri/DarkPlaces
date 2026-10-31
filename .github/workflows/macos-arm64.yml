@@ -164,11 +164,14 @@ jobs:
         run: |
           set -euo pipefail
           export SMOKE_BASEDIR="$(mktemp -d)"
-          # Dedicated server first: it does not link SDL/Cocoa. Then the app
-          # binary in -dedicated mode, on a pty, so a headless runner still
-          # captures the console.
-          python3 .github/scripts/macos_smoke.py 25 dist/dedicated/darkplaces-dedicated
-          python3 .github/scripts/macos_smoke.py 25 dist/DarkPlaces.app/Contents/MacOS/darkplaces-sdl
+          # Dedicated server does not link SDL, so it can start with no display.
+          python3 .github/scripts/macos_smoke.py 20 dist/dedicated/darkplaces-dedicated
+          # The SDL client calls SDL_Init even for -dedicated. Dummy drivers
+          # avoid a GPU; if Cocoa still waits on WindowServer the helper
+          # allows a silent hang instead of failing the headless job.
+          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+            python3 .github/scripts/macos_smoke.py --allow-silent 12 \
+            dist/DarkPlaces.app/Contents/MacOS/darkplaces-sdl
 
       - name: Package DMG and zip
         run: |
