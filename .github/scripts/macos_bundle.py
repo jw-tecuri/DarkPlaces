@@ -319,8 +319,11 @@ class Bundler:
         return self.ensure_bundled(found)
 
 
-def search_dirs(jpeg_prefix: Path) -> list[Path]:
+def search_dirs(jpeg_prefix: Path, extra_libdirs: list[Path] | None = None) -> list[Path]:
     dirs = []
+    for extra in extra_libdirs or []:
+        if extra.is_dir():
+            dirs.append(extra)
     jpeg_lib = jpeg_prefix / "lib"
     if jpeg_lib.is_dir():
         dirs.append(jpeg_lib)
@@ -539,7 +542,11 @@ def bundle(args: argparse.Namespace) -> None:
     icon_src = Path(args.icon).resolve()
     shutil.copy2(icon_src, resources / "Darkplaces.icns")
 
-    bundler = Bundler(frameworks, search_dirs(Path(args.jpeg_prefix)), exe)
+    bundler = Bundler(
+        frameworks,
+        search_dirs(Path(args.jpeg_prefix), [Path(path) for path in args.extra_libdir]),
+        exe,
+    )
     bundler.rewrite(exe, ["@executable_path/../Frameworks"])
     for seed in REQUIRED_SEEDS:
         print(f"seeding {seed}")
@@ -619,6 +626,7 @@ def main() -> None:
     bundle_parser.add_argument("--dedicated-dir", required=True)
     bundle_parser.add_argument("--icon", required=True)
     bundle_parser.add_argument("--jpeg-prefix", required=True)
+    bundle_parser.add_argument("--extra-libdir", action="append", default=[])
     bundle_parser.add_argument("--version-short", required=True)
     bundle_parser.add_argument("--version-bundle", required=True)
     bundle_parser.add_argument("--git-describe", required=True)

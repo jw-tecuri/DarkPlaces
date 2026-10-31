@@ -176,6 +176,7 @@ jobs:
             --dedicated-dir dist/dedicated \
             --icon Darkplaces.app/Contents/Resources/Darkplaces.icns \
             --jpeg-prefix "$JPEG_PREFIX" \
+            --extra-libdir "$SDL_PREFIX/lib" \
             --version-short "$short_version" \
             --version-bundle "$bundle_version" \
             --git-describe "$git_describe" \
