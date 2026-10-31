@@ -202,6 +202,34 @@ notfound:
 					Sys_FreeLibrary (&dllhandle);
 			}
 		}
+#ifdef MACOSX
+		/*
+		 * macOS app bundles keep non-system dylibs in Contents/Frameworks.
+		 * dlopen() of a bare soname does not search @rpath or LC_RPATH, and the
+		 * names above are only tried next to the executable (Contents/MacOS).
+		 * Also try ../Frameworks so JPG/PNG/Vorbis/curl libraries shipped inside
+		 * DarkPlaces.app are found. Harmless if that directory is absent.
+		 */
+		if (!dllhandle)
+		{
+			for (i = 0; dllnames[i] != NULL; i++)
+			{
+				char temp[MAX_OSPATH];
+				dp_strlcpy(temp, path, sizeof(temp));
+				dp_strlcat(temp, "../Frameworks/", sizeof(temp));
+				dp_strlcat(temp, dllnames[i], sizeof(temp));
+				Con_DPrintf (" \"%s\"", temp);
+
+				if(Sys_LoadLibrary(temp, &dllhandle))
+				{
+					if (Sys_LoadDependencyFunctions(dllhandle, fcts, true, (dllnames[i+1] != NULL) || (strrchr(sys.argv[0], '/'))))
+						break;
+					else
+						Sys_FreeLibrary (&dllhandle);
+				}
+			}
+		}
+#endif
 	}
 
 	// No DLL found

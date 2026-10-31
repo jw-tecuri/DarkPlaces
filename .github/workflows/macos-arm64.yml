@@ -1,0 +1,287 @@
+name: macOS arm64
+
+# Native Apple Silicon app bundle. A push to this branch, or a manual run,
+# builds the current commit and publishes pre-release tag darkplaces-arm64-test1.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cursor/macos-arm64-prerelease-e164
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COPYFILE_DISABLE: "1"
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+  LIBJPEG_TURBO_VERSION: "3.2.1"
+
+jobs:
+  macos-arm64:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Confirm Apple Silicon runner
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          test "$(uname -m)" = "arm64"
+
+      - name: Install Homebrew dependencies
+        run: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/bin:$PATH"
+          brew install cmake sdl2 libpng libogg libvorbis theora freetype libxmp curl pkgconf
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          sdl2-config --version
+          echo "sdl2 cflags: $(sdl2-config --cflags)"
+          echo "sdl2 static-libs: $(sdl2-config --static-libs)"
+
+      - name: Build libjpeg-turbo with the libjpeg 6b ABI
+        run: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/bin:$PATH"
+          prefix="$RUNNER_TEMP/libjpeg62"
+          src="$RUNNER_TEMP/libjpeg-turbo-src"
+          mkdir -p "$src"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/libjpeg-turbo.tar.gz" \
+            "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${LIBJPEG_TURBO_VERSION}/libjpeg-turbo-${LIBJPEG_TURBO_VERSION}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/libjpeg-turbo.tar.gz" -C "$src" --strip-components=1
+          cmake -S "$src" -B "$src/build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$prefix" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DENABLE_SHARED=ON \
+            -DENABLE_STATIC=OFF \
+            -DWITH_JPEG7=OFF \
+            -DWITH_JPEG8=OFF \
+            -DWITH_TURBOJPEG=OFF \
+            -DWITH_TOOLS=OFF \
+            -DWITH_TESTS=OFF
+          cmake --build "$src/build" -j"$(sysctl -n hw.ncpu)"
+          cmake --install "$src/build"
+          ls -l "$prefix/lib"
+          test -e "$prefix/lib/libjpeg.62.dylib"
+          echo "JPEG_PREFIX=$prefix" >> "$GITHUB_ENV"
+
+      - name: Build DarkPlaces client and dedicated server
+        run: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/bin:$PATH"
+          chmod +x .github/scripts/cc-with-headerpad.sh
+          printf '%s\n' '#!/bin/bash' 'strip -x "$@" || strip "$@" || true' > "$RUNNER_TEMP/strip-safe.sh"
+          chmod +x "$RUNNER_TEMP/strip-safe.sh"
+          git describe --tags --always --dirty
+          make -j"$(sysctl -n hw.ncpu)" sdl-release sv-release \
+            CC="$GITHUB_WORKSPACE/.github/scripts/cc-with-headerpad.sh" \
+            STRIP="$RUNNER_TEMP/strip-safe.sh" \
+            CFLAGS_EXTRA="-arch arm64 -mmacosx-version-min=11.0"
+          test -x darkplaces-sdl
+          test -x darkplaces-dedicated
+          lipo -archs darkplaces-sdl | grep -qx arm64
+          lipo -archs darkplaces-dedicated | grep -qx arm64
+          echo "---- darkplaces-sdl ----"
+          otool -L darkplaces-sdl
+          echo "---- darkplaces-dedicated ----"
+          otool -L darkplaces-dedicated
+
+      - name: Bundle DarkPlaces.app
+        run: |
+          set -euo pipefail
+          short_version="$(date -u +%Y.%m.%d)"
+          bundle_version="$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}"
+          git_describe="$(git describe --tags --always --dirty)"
+          commit="$(git rev-parse HEAD)"
+          python3 .github/scripts/macos_bundle.py bundle \
+            --app dist/DarkPlaces.app \
+            --exe darkplaces-sdl \
+            --dedicated darkplaces-dedicated \
+            --dedicated-dir dist/dedicated \
+            --icon Darkplaces.app/Contents/Resources/Darkplaces.icns \
+            --jpeg-prefix "$JPEG_PREFIX" \
+            --version-short "$short_version" \
+            --version-bundle "$bundle_version" \
+            --git-describe "$git_describe" \
+            --commit "$commit"
+          test "$(plutil -extract CFBundleIdentifier raw dist/DarkPlaces.app/Contents/Info.plist)" = "io.github.darkplacesengine.darkplaces"
+          test "$(plutil -extract CFBundleExecutable raw dist/DarkPlaces.app/Contents/Info.plist)" = "darkplaces-sdl"
+          test -f dist/DarkPlaces.app/Contents/Resources/Darkplaces.icns
+          echo "---- bundled client ----"
+          otool -L dist/DarkPlaces.app/Contents/MacOS/darkplaces-sdl
+          echo "---- bundled dedicated ----"
+          otool -L dist/dedicated/darkplaces-dedicated
+
+      - name: dlopen the libraries DarkPlaces searches for
+        run: |
+          set -euo pipefail
+          clang -arch arm64 -mmacosx-version-min=11.0 -o "$RUNNER_TEMP/dlopen_check" .github/scripts/dlopen_check.c
+          fw="dist/DarkPlaces.app/Contents/MacOS/../Frameworks"
+          "$RUNNER_TEMP/dlopen_check" \
+            "$fw/libjpeg.62.dylib" jpeg_CreateDecompress \
+            "$fw/libpng16.16.dylib" png_create_read_struct \
+            "$fw/libogg.dylib" ogg_sync_init \
+            "$fw/libvorbis.dylib" vorbis_info_init \
+            "$fw/libvorbisfile.dylib" ov_open_callbacks \
+            "$fw/libvorbisenc.dylib" vorbis_encode_init \
+            "$fw/libtheora.dylib" theora_decode_header \
+            "$fw/libfreetype.6.dylib" FT_Init_FreeType \
+            "$fw/libfreetype.dylib" FT_Init_FreeType \
+            "$fw/libxmp.4.dylib" xmp_create_context \
+            "$fw/libxmp.dylib" xmp_create_context \
+            "$fw/libcurl.4.dylib" curl_easy_init
+          ded="dist/dedicated"
+          "$RUNNER_TEMP/dlopen_check" \
+            "$ded/libjpeg.62.dylib" jpeg_CreateDecompress \
+            "$ded/libpng16.16.dylib" png_create_read_struct \
+            "$ded/libvorbis.dylib" vorbis_info_init \
+            "$ded/libvorbisfile.dylib" ov_open_callbacks \
+            "$ded/libogg.dylib" ogg_sync_init \
+            "$ded/libtheora.dylib" theora_decode_header \
+            "$ded/libcurl.4.dylib" curl_easy_init
+
+      - name: Smoke test without a display, GPU, or game data
+        run: |
+          set -euo pipefail
+          smoke() {
+            local bin="$1"
+            local log pid i saw_version=0 saw_missing=0 saw_map=0 saw_curl=0
+            log="$(mktemp)"
+            local empty
+            empty="$(mktemp -d)"
+            echo "smoke: $bin"
+            "$bin" -dedicated -nocrashdialog -nohome -basedir "$empty" >"$log" 2>&1 &
+            pid=$!
+            for i in $(seq 1 30); do
+              if grep -q "macOS dedicated" "$log"; then saw_version=1; fi
+              if grep -q "empty or not found" "$log"; then saw_missing=1; fi
+              if grep -q "no map file" "$log"; then saw_map=1; fi
+              if grep -q 'Loaded library "libcurl' "$log"; then saw_curl=1; fi
+              if [[ "$saw_version" == 1 && "$saw_missing" == 1 && "$saw_map" == 1 && "$saw_curl" == 1 ]]; then
+                break
+              fi
+              if ! kill -0 "$pid" 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+            kill -TERM "$pid" 2>/dev/null || true
+            for i in $(seq 1 10); do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            echo "----- $bin -----"
+            cat "$log"
+            echo "----- end -----"
+            if grep -q "Engine Crash" "$log" || grep -q "Library not loaded" "$log"; then
+              echo "smoke test crashed or failed to load a library"
+              return 1
+            fi
+            if [[ "$saw_version" != 1 || "$saw_missing" != 1 || "$saw_map" != 1 || "$saw_curl" != 1 ]]; then
+              echo "smoke test did not report version, missing id1, a missing map, and libcurl (version=$saw_version missing=$saw_missing map=$saw_map curl=$saw_curl)"
+              return 1
+            fi
+          }
+          smoke "dist/DarkPlaces.app/Contents/MacOS/darkplaces-sdl"
+          smoke "dist/dedicated/darkplaces-dedicated"
+
+      - name: Package DMG and zip
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/macos_bundle.py audit dist/DarkPlaces.app
+          python3 .github/scripts/macos_bundle.py audit dist/dedicated
+
+          dmg_src="$(mktemp -d)"
+          cp -R dist/DarkPlaces.app "$dmg_src/DarkPlaces.app"
+          ln -s /Applications "$dmg_src/Applications"
+          rm -f DarkPlaces-macos-arm64.dmg
+          hdiutil create -volname "DarkPlaces" -srcfolder "$dmg_src" -ov -format UDZO DarkPlaces-macos-arm64.dmg
+
+          mount="$(mktemp -d)"
+          hdiutil attach DarkPlaces-macos-arm64.dmg -nobrowse -readonly -mountpoint "$mount"
+          detach() { hdiutil detach "$mount" || hdiutil detach -force "$mount" || true; }
+          trap detach EXIT
+          test -d "$mount/DarkPlaces.app"
+          test -L "$mount/Applications"
+          test "$(readlink "$mount/Applications")" = "/Applications"
+          codesign --verify --deep --strict --verbose=2 "$mount/DarkPlaces.app"
+          python3 .github/scripts/macos_bundle.py audit "$mount/DarkPlaces.app"
+          trap - EXIT
+          detach
+          codesign --verify --deep --strict --verbose=2 dist/DarkPlaces.app
+
+          stage="$(mktemp -d)/DarkPlaces-macos-arm64"
+          mkdir -p "$stage/dedicated"
+          cp -R dist/DarkPlaces.app "$stage/DarkPlaces.app"
+          cp -R dist/dedicated/. "$stage/dedicated/"
+          cp .github/scripts/macos-arm64-readme.txt "$stage/README.txt"
+          rm -f DarkPlaces-macos-arm64.zip
+          ditto -c -k --keepParent "$stage" DarkPlaces-macos-arm64.zip
+          shasum -a 256 DarkPlaces-macos-arm64.dmg DarkPlaces-macos-arm64.zip | tee checksums.txt
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkPlaces-macos-arm64
+          path: |
+            DarkPlaces-macos-arm64.dmg
+            DarkPlaces-macos-arm64.zip
+            checksums.txt
+          if-no-files-found: error
+
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git_describe="$(git describe --tags --always --dirty)"
+          {
+            echo "Unofficial macOS Apple Silicon build of DarkPlaces from the jw-tecuri/DarkPlaces fork (not an upstream DarkPlacesEngine release)."
+            echo
+            echo "Ad-hoc signed with \`codesign --force --sign -\`. Not notarized. Gatekeeper will block a downloaded app until you right-click Open, or run \`xattr -dr com.apple.quarantine DarkPlaces.app\`."
+            echo
+            echo "No Quake game data is shipped."
+            echo
+            echo "Default game-data path on macOS: if \`DarkPlaces.app/Contents/Resources/id1\` exists, \`Contents/Resources\` is the base directory. Otherwise the base directory is the folder that contains \`DarkPlaces.app\` (place \`id1/pak0.pak\` next to the app). Override with \`-basedir /path/to/quake\` where that path contains \`id1/\`. Config and saves go to \`~/Library/Application Support/darkplaces/\` unless you pass \`-nohome\`."
+            echo
+            echo "Example: \`open DarkPlaces.app --args -basedir /Games/Quake\`"
+            echo
+            echo "The DMG contains DarkPlaces.app and an /Applications shortcut. The zip also contains \`dedicated/darkplaces-dedicated\` and the dylibs that binary dlopens. Run it with \`./dedicated/darkplaces-dedicated -dedicated -basedir /Games/Quake\`."
+            echo
+            echo "OpenGL is deprecated on macOS. This build still requests an OpenGL 3.2 Core context (macOS provides up to OpenGL 4.1). JPG/PNG/Ogg Vorbis/Theora/FreeType/libxmp/curl are dlopen'd from Contents/Frameworks using the engine's macOS sonames (libjpeg is the v6b ABI, \`libjpeg.62.dylib\`, not Homebrew's libjpeg v8 bottle)."
+            echo
+            echo "Commit: \`$git_describe\` (\`${GITHUB_SHA}\`)"
+            echo
+            echo "SHA-256:"
+            echo '```'
+            cat checksums.txt
+            echo '```'
+          } > release-notes.md
+          if gh release view darkplaces-arm64-test1 >/dev/null 2>&1; then
+            gh release delete darkplaces-arm64-test1 --yes --cleanup-tag
+          fi
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/darkplaces-arm64-test1" >/dev/null 2>&1 || true
+          gh release create darkplaces-arm64-test1 \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "DarkPlaces macOS arm64 test1 (unofficial)" \
+            --notes-file release-notes.md \
+            DarkPlaces-macos-arm64.dmg \
+            DarkPlaces-macos-arm64.zip
