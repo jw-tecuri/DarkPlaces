@@ -86,10 +86,17 @@ jobs:
           printf '%s\n' '#!/bin/bash' 'strip -x "$@" || strip "$@" || true' > "$RUNNER_TEMP/strip-safe.sh"
           chmod +x "$RUNNER_TEMP/strip-safe.sh"
           git describe --tags --always --dirty
+          # Homebrew's CMake sdl2-config does not implement --static-libs (the
+          # makefile's macOS default), so link the shared SDL2 it does provide.
+          # CFSTR() in vid_sdl.c needs CoreFoundation in addition to IOKit.
+          sdl_libs="$(sdl2-config --libs)"
+          echo "sdl2 --libs: ${sdl_libs}"
+          echo "sdl2 --static-libs (informational): $(sdl2-config --static-libs || true)"
           make -j"$(sysctl -n hw.ncpu)" sdl-release sv-release \
             CC="$GITHUB_WORKSPACE/.github/scripts/cc-with-headerpad.sh" \
             STRIP="$RUNNER_TEMP/strip-safe.sh" \
-            CFLAGS_EXTRA="-arch arm64 -mmacosx-version-min=11.0"
+            CFLAGS_EXTRA="-arch arm64 -mmacosx-version-min=11.0" \
+            LDFLAGS_MACOSXSDL="-lm -lz -ldl -framework IOKit -framework CoreFoundation ${sdl_libs}"
           test -x darkplaces-sdl
           test -x darkplaces-dedicated
           lipo -archs darkplaces-sdl | grep -qx arm64
