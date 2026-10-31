@@ -514,7 +514,10 @@ def audit(root: Path) -> None:
             if rpath not in ALLOWED_RPATHS or rpath_is_hostile(rpath):
                 bad_deps.append(f"{path} LC_RPATH: {rpath}")
         blob = path.read_bytes()
-        for needle in (b"libSDL3", b"sdl2-compat", b"opt/sdl3", b"/opt/homebrew", b"/usr/local/"):
+        # OpenSSL embeds its build prefix as a cert path, so a raw /opt/homebrew
+        # string is not a load command. LC_RPATH/LC_LOAD_DYLIB are checked above.
+        # These needles are the sdl2-compat shim's runtime SDL3 lookup.
+        for needle in (b"libSDL3", b"sdl2-compat", b"opt/sdl3"):
             if needle in blob:
                 bad_deps.append(f"{path} contains {needle.decode()}")
 
