@@ -16,7 +16,7 @@ import sys
 import time
 
 
-def run(argv: list[str], seconds: float) -> tuple[str, int | None, bool]:
+def run(argv: list[str], seconds: float, send_quit: bool) -> tuple[str, int | None, bool]:
     output = bytearray()
     pid, fd = pty.fork()
     if pid == 0:
@@ -24,6 +24,7 @@ def run(argv: list[str], seconds: float) -> tuple[str, int | None, bool]:
         os._exit(127)
     status: int | None = None
     timed_out = False
+    sent_quit = False
     deadline = time.time() + seconds
     try:
         while time.time() < deadline:
@@ -36,6 +37,14 @@ def run(argv: list[str], seconds: float) -> tuple[str, int | None, bool]:
                 if not chunk:
                     break
                 output.extend(chunk)
+            # quit inside quake.rc is overwritten when Host_Init forces host_active.
+            # The dedicated console reads stdin once the frame loop is running.
+            if send_quit and not sent_quit and b"macOS dedicated" in output:
+                try:
+                    os.write(fd, b"quit\n")
+                except OSError:
+                    pass
+                sent_quit = True
             waited, code = os.waitpid(pid, os.WNOHANG)
             if waited == pid:
                 status = code
@@ -81,7 +90,7 @@ def main() -> None:
     empty = os.environ["SMOKE_BASEDIR"]
     argv.extend(["-dedicated", "-nocrashdialog", "-nohome", "-stderr", "-basedir", empty])
     print(f"smoke: {argv}", flush=True)
-    text, status, timed_out = run(argv, seconds)
+    text, status, timed_out = run(argv, seconds, send_quit=must_exit)
     print("----- output -----")
     print(text)
     print("----- end -----")
