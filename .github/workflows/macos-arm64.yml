@@ -1,7 +1,8 @@
 name: macOS arm64
 
 # Native Apple Silicon app bundle. A push to this branch, or a manual run,
-# builds the current commit and publishes pre-release tag darkplaces-arm64-test1.
+# builds the current commit and publishes pre-release tag darkplaces-arm64-test2.
+# darkplaces-arm64-test1 is left in place.
 on:
   workflow_dispatch:
   push:
@@ -22,6 +23,7 @@ env:
   HOMEBREW_NO_ENV_HINTS: "1"
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
   LIBJPEG_TURBO_VERSION: "3.2.1"
+  SDL2_VERSION: "2.32.10"
 
 jobs:
   macos-arm64:
@@ -44,11 +46,49 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/opt/homebrew/bin:$PATH"
-          brew install cmake sdl2 libpng libogg libvorbis theora freetype libxmp curl pkgconf
+          # Do not install Homebrew sdl2. Current bottles are the sdl2-compat shim,
+          # which dlopens libSDL3 and keeps an @loader_path rpath into opt/sdl3.
+          brew install cmake libpng libogg libvorbis theora freetype libxmp curl pkgconf
           echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
-          sdl2-config --version
-          echo "sdl2 cflags: $(sdl2-config --cflags)"
-          echo "sdl2 static-libs: $(sdl2-config --static-libs)"
+
+      - name: Build SDL 2.32 from source
+        run: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/bin:$PATH"
+          prefix="$RUNNER_TEMP/sdl2"
+          src="$RUNNER_TEMP/sdl2-src"
+          mkdir -p "$src"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/SDL2.tar.gz" \
+            "https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-${SDL2_VERSION}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/SDL2.tar.gz" -C "$src" --strip-components=1
+          cmake -S "$src" -B "$src/build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$prefix" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DSDL_SHARED=ON \
+            -DSDL_STATIC=OFF \
+            -DSDL_TEST=OFF \
+            -DSDL_FRAMEWORK=OFF
+          cmake --build "$src/build" -j"$(sysctl -n hw.ncpu)"
+          cmake --install "$src/build"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          export PATH="$prefix/bin:$PATH"
+          version="$(sdl2-config --version)"
+          echo "built sdl2-config ${version}"
+          echo "sdl2 --libs: $(sdl2-config --libs)"
+          test "$version" = "$SDL2_VERSION"
+          sdl_lib="$(find "$prefix/lib" -name 'libSDL2*.dylib' ! -type l | head -n 1)"
+          test -n "$sdl_lib"
+          echo "SDL dylib: $sdl_lib"
+          otool -L "$sdl_lib"
+          echo "---- LC_RPATH ----"
+          otool -l "$sdl_lib" | awk '/cmd LC_RPATH/{p=1} p && /path /{print; p=0}'
+          if strings "$sdl_lib" | grep -E -q 'libSDL3|sdl2-compat|opt/sdl3'; then
+            echo "built library is the sdl2-compat shim, not SDL2 ${SDL2_VERSION}"
+            exit 1
+          fi
+          echo "SDL_PREFIX=$prefix" >> "$GITHUB_ENV"
 
       - name: Build libjpeg-turbo with the libjpeg 6b ABI
         run: |
@@ -81,19 +121,32 @@ jobs:
       - name: Build DarkPlaces client and dedicated server
         run: |
           set -euo pipefail
-          export PATH="/opt/homebrew/bin:$PATH"
-          chmod +x .github/scripts/cc-with-headerpad.sh
+          export PATH="${SDL_PREFIX}/bin:/opt/homebrew/bin:$PATH"
+          # chmod on a tracked script flips the index to dirty and git describe
+          # then appends '~'. Run a copy so the checkout stays clean.
+          cp .github/scripts/cc-with-headerpad.sh "$RUNNER_TEMP/cc-with-headerpad.sh"
+          chmod +x "$RUNNER_TEMP/cc-with-headerpad.sh"
           printf '%s\n' '#!/bin/bash' 'strip -x "$@" || strip "$@" || true' > "$RUNNER_TEMP/strip-safe.sh"
           chmod +x "$RUNNER_TEMP/strip-safe.sh"
-          git describe --tags --always --dirty
-          # Homebrew's CMake sdl2-config does not implement --static-libs (the
-          # makefile's macOS default), so link the shared SDL2 it does provide.
+          if ! git diff --quiet; then
+            echo "tracked files changed before the build; refusing a -dirty version string"
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+          git_describe="$(git describe --tags --always --dirty=-dirty)"
+          echo "git describe: ${git_describe}"
+          case "$git_describe" in
+            *-dirty|*~) echo "describe is dirty"; exit 1 ;;
+          esac
+          echo "GIT_DESCRIBE=${git_describe}" >> "$GITHUB_ENV"
           # CFSTR() in vid_sdl.c needs CoreFoundation in addition to IOKit.
+          # Use the SDL 2.32 we just built, not whatever sdl2-config Homebrew has.
           sdl_libs="$(sdl2-config --libs)"
+          echo "sdl2 --version: $(sdl2-config --version)"
           echo "sdl2 --libs: ${sdl_libs}"
-          echo "sdl2 --static-libs (informational): $(sdl2-config --static-libs || true)"
           make -j"$(sysctl -n hw.ncpu)" sdl-release sv-release \
-            CC="$GITHUB_WORKSPACE/.github/scripts/cc-with-headerpad.sh" \
+            CC="$RUNNER_TEMP/cc-with-headerpad.sh" \
             STRIP="$RUNNER_TEMP/strip-safe.sh" \
             CFLAGS_EXTRA="-arch arm64 -mmacosx-version-min=11.0" \
             LDFLAGS_MACOSXSDL="-lm -lz -ldl -framework IOKit -framework CoreFoundation ${sdl_libs}"
@@ -111,7 +164,10 @@ jobs:
           set -euo pipefail
           short_version="$(date -u +%Y.%m.%d)"
           bundle_version="$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}"
-          git_describe="$(git describe --tags --always --dirty)"
+          git_describe="${GIT_DESCRIBE}"
+          case "$git_describe" in
+            *-dirty|*~) echo "refusing to stamp a dirty describe: ${git_describe}"; exit 1 ;;
+          esac
           commit="$(git rev-parse HEAD)"
           python3 .github/scripts/macos_bundle.py bundle \
             --app dist/DarkPlaces.app \
@@ -166,11 +222,14 @@ jobs:
           export SMOKE_BASEDIR="$(mktemp -d)"
           # Dedicated server does not link SDL, so it can start with no display.
           python3 .github/scripts/macos_smoke.py 20 dist/dedicated/darkplaces-dedicated
-          # The SDL client calls SDL_Init even for -dedicated. Dummy drivers
-          # avoid a GPU; if Cocoa still waits on WindowServer the helper
-          # allows a silent hang instead of failing the headless job.
-          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-            python3 .github/scripts/macos_smoke.py --allow-silent 12 \
+          # The app binary must print and exit by itself. A timeout is a failure:
+          # sdl2-compat aborts in its initializer (or blocks on the SDL3 dialog)
+          # before main, which previously looked like a silent hang.
+          app_base="$(mktemp -d)"
+          mkdir -p "$app_base/id1"
+          printf '%s\n' 'quit' > "$app_base/id1/quake.rc"
+          SMOKE_BASEDIR="$app_base" SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+            python3 .github/scripts/macos_smoke.py --must-exit 20 \
             dist/DarkPlaces.app/Contents/MacOS/darkplaces-sdl
 
       - name: Package DMG and zip
@@ -222,7 +281,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git_describe="$(git describe --tags --always --dirty)"
+          if ! git diff --quiet; then
+            echo "tracked files are dirty at publish time"
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+          case "${GIT_DESCRIBE}" in
+            *-dirty|*~) echo "refusing to publish a dirty describe: ${GIT_DESCRIBE}"; exit 1 ;;
+          esac
           {
             echo "Unofficial macOS Apple Silicon build of DarkPlaces from the jw-tecuri/DarkPlaces fork (not an upstream DarkPlacesEngine release)."
             echo
@@ -236,23 +303,24 @@ jobs:
             echo
             echo "The DMG contains DarkPlaces.app and an /Applications shortcut. The zip also contains \`dedicated/darkplaces-dedicated\` and the dylibs that binary dlopens. Run it with \`./dedicated/darkplaces-dedicated -dedicated -basedir /Games/Quake\`."
             echo
-            echo "OpenGL is deprecated on macOS. This build still requests an OpenGL 3.2 Core context (macOS provides up to OpenGL 4.1). JPG/PNG/Ogg Vorbis/Theora/FreeType/libxmp/curl are dlopen'd from Contents/Frameworks using the engine's macOS sonames (libjpeg is the v6b ABI, \`libjpeg.62.dylib\`, not Homebrew's libjpeg v8 bottle)."
+            echo "OpenGL is deprecated on macOS. This build still requests an OpenGL 3.2 Core context (macOS provides up to OpenGL 4.1). SDL is SDL2 ${SDL2_VERSION} built from source, not Homebrew sdl2-compat (that shim dlopens libSDL3). JPG/PNG/Ogg Vorbis/Theora/FreeType/libxmp/curl are dlopen'd from Contents/Frameworks using the engine's macOS sonames (libjpeg is the v6b ABI, \`libjpeg.62.dylib\`, not Homebrew's libjpeg v8 bottle)."
             echo
-            echo "Commit: \`$git_describe\` (\`${GITHUB_SHA}\`)"
+            echo "Commit: \`${GIT_DESCRIBE}\` (\`${GITHUB_SHA}\`)"
             echo
             echo "SHA-256:"
             echo '```'
             cat checksums.txt
             echo '```'
           } > release-notes.md
-          if gh release view darkplaces-arm64-test1 >/dev/null 2>&1; then
-            gh release delete darkplaces-arm64-test1 --yes --cleanup-tag
+          # Leave darkplaces-arm64-test1 published. Replace only test2 on reruns.
+          if gh release view darkplaces-arm64-test2 >/dev/null 2>&1; then
+            gh release delete darkplaces-arm64-test2 --yes --cleanup-tag
           fi
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/darkplaces-arm64-test1" >/dev/null 2>&1 || true
-          gh release create darkplaces-arm64-test1 \
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/darkplaces-arm64-test2" >/dev/null 2>&1 || true
+          gh release create darkplaces-arm64-test2 \
             --prerelease \
             --target "$GITHUB_SHA" \
-            --title "DarkPlaces macOS arm64 test1 (unofficial)" \
+            --title "DarkPlaces macOS arm64 test2 (unofficial)" \
             --notes-file release-notes.md \
             DarkPlaces-macos-arm64.dmg \
             DarkPlaces-macos-arm64.zip

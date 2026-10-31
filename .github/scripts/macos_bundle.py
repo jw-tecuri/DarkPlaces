@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -71,7 +72,14 @@ ALIASES = {
 }
 
 SYSTEM_PREFIXES = ("/usr/lib/", "/System/")
-ALLOWED_RPATH_PREFIXES = ("@loader_path", "@executable_path")
+# Exact LC_RPATH allowlist. A prefix check is not enough: Homebrew's
+# sdl2-compat shim uses @loader_path/../../../../opt/sdl3/lib, which otool -L
+# never shows and which still starts with @loader_path.
+ALLOWED_RPATHS = {
+    "@loader_path",
+    "@executable_path",
+    "@executable_path/../Frameworks",
+}
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> str:
@@ -294,14 +302,14 @@ class Bundler:
             new_id = f"@rpath/{path.name}"
             if ident != new_id:
                 run(["install_name_tool", "-id", new_id, str(path)])
+        # Drop every existing rpath, including @loader_path/.../opt/sdl3/lib,
+        # then install only the bundle-relative ones this binary needs.
         for rpath in otool_rpaths(path):
-            if rpath.startswith(ALLOWED_RPATH_PREFIXES):
-                continue
             run(["install_name_tool", "-delete_rpath", rpath, str(path)])
-        current = set(otool_rpaths(path))
         for rpath in rpaths:
-            if rpath not in current:
-                run(["install_name_tool", "-add_rpath", rpath, str(path)])
+            if rpath not in ALLOWED_RPATHS:
+                raise SystemExit(f"refusing to add rpath {rpath} on {path}")
+            run(["install_name_tool", "-add_rpath", rpath, str(path)])
 
     def seed(self, base: str) -> str:
         found = self.find_basename(base)
@@ -386,6 +394,66 @@ def macho_files(root: Path) -> list[Path]:
     return found
 
 
+def rpath_is_hostile(rpath: str) -> bool:
+    lowered = rpath.lower()
+    return any(token in lowered for token in ("homebrew", "opt/sdl3", "/opt/", "usr/local", "sdl3"))
+
+
+# System dylibs a bundled library may name without shipping a copy.
+SYSTEM_DYLIB_BASES = {
+    "libz.dylib",
+    "libz.1.dylib",
+    "libSystem.B.dylib",
+    "libc++.1.dylib",
+    "libc++abi.dylib",
+    "libobjc.A.dylib",
+    "libiconv.2.dylib",
+    "libiconv.dylib",
+    "libresolv.9.dylib",
+    "libcharset.1.dylib",
+}
+
+DYLIB_REF = re.compile(rb"[\w@./+\-]{1,240}\.dylib")
+
+
+def hidden_dlopen_problems(root: Path) -> list[str]:
+    """Flag bundled libraries that name a dylib the bundle does not contain.
+
+    otool -L misses dlopen() targets. sdl2-compat does this for libSDL3.0.dylib.
+    The engine binary itself lists optional sonames (libd0_blind_id, …), so only
+    the shipped dylibs are scanned here.
+    """
+    bundled = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+        for name in filenames:
+            if name.endswith(".dylib"):
+                bundled.add(name)
+    problems = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+        for name in filenames:
+            path = current / name
+            if path.is_symlink() or not name.endswith(".dylib"):
+                continue
+            data = path.read_bytes()
+            seen = set()
+            for match in DYLIB_REF.findall(data):
+                text = match.decode("ascii", "ignore")
+                base = os.path.basename(text)
+                if base in seen:
+                    continue
+                seen.add(base)
+                if base in bundled or base in SYSTEM_DYLIB_BASES:
+                    continue
+                if text.startswith("/usr/lib/") or text.startswith("/System/"):
+                    continue
+                problems.append(f"{path} names non-bundled dylib {text}")
+    return problems
+
+
 def audit(root: Path) -> None:
     root = root.resolve()
     print(f"auditing {root}")
@@ -435,16 +503,21 @@ def audit(root: Path) -> None:
                 continue
             bad_deps.append(f"{path}: {dep}")
         for rpath in otool_rpaths(path):
-            if "/opt/homebrew" in rpath or "/usr/local" in rpath or rpath.startswith("/"):
-                bad_deps.append(f"{path} rpath: {rpath}")
+            if rpath not in ALLOWED_RPATHS or rpath_is_hostile(rpath):
+                bad_deps.append(f"{path} LC_RPATH: {rpath}")
+        blob = path.read_bytes()
+        for needle in (b"libSDL3", b"sdl2-compat", b"opt/sdl3", b"/opt/homebrew", b"/usr/local/"):
+            if needle in blob:
+                bad_deps.append(f"{path} contains {needle.decode()}")
 
-    problems = dangling + outside + bad_arch + bad_deps + framework_errors
+    hidden = hidden_dlopen_problems(root)
+    problems = dangling + outside + bad_arch + bad_deps + framework_errors + hidden
     if problems:
         print("bundle audit failed:", file=sys.stderr)
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
         raise SystemExit(1)
-    print(f"audit ok ({len(macho_files(root))} Mach-O files, arm64, no Homebrew/usr/local load commands)")
+    print(f"audit ok ({len(macho_files(root))} Mach-O files, arm64, no Homebrew/usr/local load commands or hostile LC_RPATH)")
 
 
 def bundle(args: argparse.Namespace) -> None:

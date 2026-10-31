@@ -38,6 +38,9 @@ not use the .app base-directory logic:
 macOS still ships OpenGL, but it is deprecated. This build requests an
 OpenGL 3.2 Core context. The newest OpenGL profile macOS provides is 4.1.
 
+SDL is SDL2 2.32.10 built from source. It is not the Homebrew sdl2-compat
+shim, which dlopens libSDL3 at startup.
+
 JPG, PNG, Ogg Vorbis, Theora, FreeType, libxmp and curl are dlopen'd.
 libjpeg is the v6b ABI (libjpeg.62.dylib). Homebrew's default libjpeg-turbo
 bottle is the v8 ABI and is not what this engine loads. Those libraries live

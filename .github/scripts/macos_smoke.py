@@ -16,13 +16,14 @@ import sys
 import time
 
 
-def run(argv: list[str], seconds: float) -> tuple[str, int | None]:
+def run(argv: list[str], seconds: float) -> tuple[str, int | None, bool]:
     output = bytearray()
     pid, fd = pty.fork()
     if pid == 0:
         os.execv(argv[0], argv)
         os._exit(127)
     status: int | None = None
+    timed_out = False
     deadline = time.time() + seconds
     try:
         while time.time() < deadline:
@@ -38,8 +39,9 @@ def run(argv: list[str], seconds: float) -> tuple[str, int | None]:
             waited, code = os.waitpid(pid, os.WNOHANG)
             if waited == pid:
                 status = code
-                deadline = time.time() + 0.5
+                break
         else:
+            timed_out = True
             os.kill(pid, signal.SIGTERM)
             term_deadline = time.time() + 5
             while time.time() < term_deadline:
@@ -62,44 +64,49 @@ def run(argv: list[str], seconds: float) -> tuple[str, int | None]:
     finally:
         os.close(fd)
     text = output.decode("utf-8", "replace")
-    return text, status
+    return text, status, timed_out
 
 
 def main() -> None:
     args = sys.argv[1:]
-    allow_silent = False
-    if args and args[0] == "--allow-silent":
-        allow_silent = True
+    must_exit = False
+    if args and args[0] == "--must-exit":
+        must_exit = True
         args = args[1:]
     if len(args) < 2:
-        print("usage: macos_smoke.py [--allow-silent] <seconds> <binary> [args...]", file=sys.stderr)
+        print("usage: macos_smoke.py [--must-exit] <seconds> <binary> [args...]", file=sys.stderr)
         sys.exit(2)
     seconds = float(args[0])
     argv = args[1:]
     empty = os.environ["SMOKE_BASEDIR"]
     argv.extend(["-dedicated", "-nocrashdialog", "-nohome", "-stderr", "-basedir", empty])
     print(f"smoke: {argv}", flush=True)
-    text, status = run(argv, seconds)
+    text, status, timed_out = run(argv, seconds)
     print("----- output -----")
     print(text)
     print("----- end -----")
-    print(f"wait status: {status}")
+    print(f"wait status: {status} timed_out: {timed_out}")
+    lowered = text.lower()
     failed = []
-    if "Engine Crash" in text or "Library not loaded" in text:
-        failed.append("crash or missing library")
-    if "macOS dedicated" not in text:
+    if timed_out and must_exit:
+        failed.append("process was still running when the timeout fired")
+    if not text.strip():
+        failed.append("no console output")
+    if "failed to load sdl3" in lowered or "libsdl3" in lowered:
+        failed.append("SDL3 load failure")
+    if "library not loaded" in lowered or "image not found" in lowered or "dlopen(" in lowered:
+        failed.append("dlopen/dyld error")
+    if "engine crash" in lowered:
+        failed.append("engine crash")
+    if "macos dedicated" not in lowered:
         failed.append("missing version banner")
-    if "empty or not found" not in text:
-        failed.append("did not report missing id1")
-    if "no map file" not in text:
-        failed.append("did not report missing map")
-    if 'Loaded library "libcurl' not in text:
-        failed.append("did not dlopen libcurl")
-    if failed and allow_silent and not text.strip():
-        print("SDL client produced no console output and stayed running.")
-        print("On this runner that usually means SDL/Cocoa is waiting on WindowServer.")
-        print("Dedicated-server smoke test is the headless check; not failing the client for silence.")
-        return
+    if not must_exit:
+        if "empty or not found" not in lowered:
+            failed.append("did not report missing id1")
+        if "no map file" not in lowered:
+            failed.append("did not report missing map")
+        if 'loaded library "libcurl' not in lowered:
+            failed.append("did not dlopen libcurl")
     if failed:
         print("smoke test failed: " + "; ".join(failed), file=sys.stderr)
         sys.exit(1)
