@@ -445,6 +445,11 @@ def hidden_dlopen_problems(root: Path) -> list[str]:
             seen = set()
             for match in DYLIB_REF.findall(data):
                 text = match.decode("ascii", "ignore")
+                # Bare names such as libvulkan.dylib are optional dlopen probes.
+                # Path-shaped references are real load locations (the sdl2-compat
+                # shim's @loader_path/.../opt/sdl3/lib/libSDL3.0.dylib is one).
+                if not (text.startswith("@") or text.startswith("/")):
+                    continue
                 base = os.path.basename(text)
                 if base in seen:
                     continue
