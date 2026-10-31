@@ -1,13 +1,18 @@
 name: macOS arm64
 
-# Native Apple Silicon app bundle. A push to this branch, or a manual run,
-# builds the current commit and publishes pre-release tag darkplaces-arm64-test2.
-# darkplaces-arm64-test1 is left in place.
+# Native Apple Silicon app bundle.
+# Pushes to master and manual runs build and test only.
+# A tag publishes a release: tags containing "-test" are pre-releases,
+# every other matching tag is a normal Latest release.
+# Examples: darkplaces-20261031-macos-arm64, darkplaces-arm64-test2.
 on:
   workflow_dispatch:
   push:
     branches:
-      - cursor/macos-arm64-prerelease-e164
+      - master
+    tags:
+      - "darkplaces-*-macos-arm64"
+      - "darkplaces-arm64-test*"
 
 permissions:
   contents: write
@@ -265,7 +270,7 @@ jobs:
           cp .github/scripts/macos-arm64-readme.txt "$stage/README.txt"
           rm -f DarkPlaces-macos-arm64.zip
           ditto -c -k --keepParent "$stage" DarkPlaces-macos-arm64.zip
-          shasum -a 256 DarkPlaces-macos-arm64.dmg DarkPlaces-macos-arm64.zip | tee checksums.txt
+          shasum -a 256 DarkPlaces-macos-arm64.dmg DarkPlaces-macos-arm64.zip | tee SHA256SUMS
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
@@ -274,10 +279,11 @@ jobs:
           path: |
             DarkPlaces-macos-arm64.dmg
             DarkPlaces-macos-arm64.zip
-            checksums.txt
+            SHA256SUMS
           if-no-files-found: error
 
-      - name: Publish pre-release
+      - name: Publish release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -291,6 +297,7 @@ jobs:
           case "${GIT_DESCRIBE}" in
             *-dirty|*~) echo "refusing to publish a dirty describe: ${GIT_DESCRIBE}"; exit 1 ;;
           esac
+          tag="${GITHUB_REF_NAME}"
           {
             echo "Unofficial macOS Apple Silicon build of DarkPlaces from the jw-tecuri/DarkPlaces fork (not an upstream DarkPlacesEngine release)."
             echo
@@ -310,18 +317,30 @@ jobs:
             echo
             echo "SHA-256:"
             echo '```'
-            cat checksums.txt
+            cat SHA256SUMS
             echo '```'
           } > release-notes.md
-          # Leave darkplaces-arm64-test1 published. Replace only test2 on reruns.
-          if gh release view darkplaces-arm64-test2 >/dev/null 2>&1; then
-            gh release delete darkplaces-arm64-test2 --yes --cleanup-tag
+          title="DarkPlaces for macOS (Apple Silicon)"
+          release_flag="--latest"
+          if [[ "$tag" == *-test* ]]; then
+            title="DarkPlaces macOS arm64 ${tag} (unofficial)"
+            release_flag="--prerelease"
           fi
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/darkplaces-arm64-test2" >/dev/null 2>&1 || true
-          gh release create darkplaces-arm64-test2 \
-            --prerelease \
-            --target "$GITHUB_SHA" \
-            --title "DarkPlaces macOS arm64 test2 (unofficial)" \
-            --notes-file release-notes.md \
-            DarkPlaces-macos-arm64.dmg \
-            DarkPlaces-macos-arm64.zip
+          # Never delete darkplaces-arm64-test1 or test2. If this tag was
+          # republished, replace its assets without moving the git tag.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber \
+              DarkPlaces-macos-arm64.dmg \
+              DarkPlaces-macos-arm64.zip \
+              SHA256SUMS
+            gh release edit "$tag" --title "$title" --notes-file release-notes.md "$release_flag"
+          else
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes-file release-notes.md \
+              "$release_flag" \
+              DarkPlaces-macos-arm64.dmg \
+              DarkPlaces-macos-arm64.zip \
+              SHA256SUMS
+          fi
