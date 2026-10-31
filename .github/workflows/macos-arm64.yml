@@ -163,51 +163,12 @@ jobs:
       - name: Smoke test without a display, GPU, or game data
         run: |
           set -euo pipefail
-          smoke() {
-            local bin="$1"
-            local log pid i saw_version=0 saw_missing=0 saw_map=0 saw_curl=0
-            log="$(mktemp)"
-            local empty
-            empty="$(mktemp -d)"
-            echo "smoke: $bin"
-            "$bin" -dedicated -nocrashdialog -nohome -basedir "$empty" >"$log" 2>&1 &
-            pid=$!
-            for i in $(seq 1 30); do
-              if grep -q "macOS dedicated" "$log"; then saw_version=1; fi
-              if grep -q "empty or not found" "$log"; then saw_missing=1; fi
-              if grep -q "no map file" "$log"; then saw_map=1; fi
-              if grep -q 'Loaded library "libcurl' "$log"; then saw_curl=1; fi
-              if [[ "$saw_version" == 1 && "$saw_missing" == 1 && "$saw_map" == 1 && "$saw_curl" == 1 ]]; then
-                break
-              fi
-              if ! kill -0 "$pid" 2>/dev/null; then
-                break
-              fi
-              sleep 1
-            done
-            kill -TERM "$pid" 2>/dev/null || true
-            for i in $(seq 1 10); do
-              if ! kill -0 "$pid" 2>/dev/null; then
-                break
-              fi
-              sleep 1
-            done
-            kill -KILL "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-            echo "----- $bin -----"
-            cat "$log"
-            echo "----- end -----"
-            if grep -q "Engine Crash" "$log" || grep -q "Library not loaded" "$log"; then
-              echo "smoke test crashed or failed to load a library"
-              return 1
-            fi
-            if [[ "$saw_version" != 1 || "$saw_missing" != 1 || "$saw_map" != 1 || "$saw_curl" != 1 ]]; then
-              echo "smoke test did not report version, missing id1, a missing map, and libcurl (version=$saw_version missing=$saw_missing map=$saw_map curl=$saw_curl)"
-              return 1
-            fi
-          }
-          smoke "dist/DarkPlaces.app/Contents/MacOS/darkplaces-sdl"
-          smoke "dist/dedicated/darkplaces-dedicated"
+          export SMOKE_BASEDIR="$(mktemp -d)"
+          # Dedicated server first: it does not link SDL/Cocoa. Then the app
+          # binary in -dedicated mode, on a pty, so a headless runner still
+          # captures the console.
+          python3 .github/scripts/macos_smoke.py 25 dist/dedicated/darkplaces-dedicated
+          python3 .github/scripts/macos_smoke.py 25 dist/DarkPlaces.app/Contents/MacOS/darkplaces-sdl
 
       - name: Package DMG and zip
         run: |
