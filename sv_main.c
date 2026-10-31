@@ -2546,7 +2546,7 @@ double SV_Frame(double time)
 			reporting = true;
 		// bones_was_here: intermission_running isn't declared in dpdefs, but it's used by
 		// id1 Quake, all Quake mods (afaict), Nexuiz and Xonotic.
-		else if (cls.state == ca_dedicated && !PRVM_serverglobalfloat(intermission_running))
+		else if (cls.state == ca_dedicated && prog->loaded && !PRVM_serverglobalfloat(intermission_running))
 		{
 			// Report lag if there's players, so they know it wasn't the network or their machine
 			for (i = 0; i < svs.maxclients; ++i)
